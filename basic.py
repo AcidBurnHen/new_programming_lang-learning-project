@@ -1,7 +1,12 @@
+import string
+
 # ---------------------------------- #
 # ------------ CONSTANS ------------ #
 
 DIGITS = "0123456789"
+LETTERS = string.ascii_letters
+LETTERS_DIGITS = LETTERS + DIGITS
+KEYWORDS = ["VAR"]
 
 # ---------------------------------- #
 # ------------- ERRORS ------------- #
@@ -115,12 +120,15 @@ class Position:
 # ---------------------------------- #
 # ------------- TOKENS ------------- #
 
+TT_IDENTIFIER = "IDENTIFIER"
+TT_KEYWORD = "KEYWORD"
 TT_INT = "INT"
 TT_FLOAT = "FLOAT"
 TT_PLUS = "PLUS"
 TT_MINUS = "MINUS"
 TT_MUL = "MUL"
 TT_DIV = "DIV"
+TT_EQ = "EQ"
 TT_LPAREN = "LPAREN"
 TT_RPAREN = "RPAREN"
 TT_EOF = "EOF"
@@ -138,6 +146,9 @@ class Token:
 
         if pos_end:
             self.pos_end = pos_end.copy()
+
+    def matches(self, type_, value):
+        return self.type == type_ and self.value == value
 
     def __repr__(self):
         if self.value:
@@ -172,6 +183,8 @@ class Lexer:
                 self.advance()
             elif self.current_char in DIGITS:
                 tokens.append(self.make_number())
+            elif self.current_char in LETTERS:
+                tokens.append(self.make_identifier())
             elif self.current_char == "+":
                 tokens.append(Token(TT_PLUS, pos_start=self.pos))
                 self.advance()
@@ -186,6 +199,9 @@ class Lexer:
                 self.advance()
             elif self.current_char == "^":
                 tokens.append(Token(TT_POW, pos_start=self.pos))
+                self.advance()
+            elif self.current_char == "=":
+                tokens.append(Token(TT_EQ, pos_start=self.pos))
                 self.advance()
             elif self.current_char == "(":
                 tokens.append(Token(TT_LPAREN, pos_start=self.pos))
@@ -226,6 +242,23 @@ class Lexer:
                 TT_FLOAT, float(num_str), pos_start=pos_start, pos_end=self.pos
             )
 
+    def make_identifier(self):
+        id_str = ""
+        pos_start = self.pos.copy()
+
+        while (
+            self.current_char is not None and self.current_char in LETTERS_DIGITS + "_"
+        ):
+            id_str += self.current_char
+            self.advance()
+
+        if id_str in KEYWORDS:
+            tok_type = TT_KEYWORD
+        else:
+            tok_type = TT_IDENTIFIER
+
+        return Token(tok_type, id_str, pos_start, self.pos)
+
 
 # ----------------------------------- #
 # -------------- Nodes -------------- #
@@ -238,6 +271,23 @@ class NumberNode:
 
     def __repr__(self):
         return f"{self.tok}"
+
+
+class VarAccessNode:
+    def __init__(self, var_name_tok):
+        self.var_name_tok = var_name_tok
+
+        self.pos_start = self.var_name_tok.pos_start
+        self.pos_end = self.var_name_tok.pos_end
+
+
+class VarAssignNode:
+    def __init__(self, var_name_tok, value_node):
+        self.var_name_tok = var_name_tok
+        self.value_node = value_node
+
+        self.pos_start = self.var_name_tok.pos_start
+        self.pos_end = self.var_name_tok.pos_end
 
 
 class BinOpNode:
@@ -274,21 +324,25 @@ class ParseResult:
     def __init__(self):
         self.error = None
         self.node = None
+        self.advance_count = 0
 
     def register(self, res):
-        if isinstance(res, ParseResult):
-            if res.error:
-                self.error = res.error
-            return res.node
+        self.advance_count += res.advance_count
+        if res.error:
+            self.error = res.error
+        return res.node
 
-        return res
+    def register_advance(self):
+        self.advance_count += 1
 
     def success(self, node):
         self.node = node
         return self
 
     def failure(self, error):
-        self.error = error
+        if not self.error or self.advance_count == 0:
+            self.error = error
+
         return self
 
 
@@ -332,16 +386,23 @@ class Parser:
         tok = self.current_tok
 
         if tok.type in (TT_INT, TT_FLOAT):
-            res.register(self.advance())
+            res.register_advance()
+            self.advance()
             return res.success(NumberNode(tok))
+        elif tok.type == TT_IDENTIFIER:
+            res.register_advance()
+            self.advance()
+            return res.success(VarAccessNode(tok))
         elif tok.type == TT_LPAREN:
-            res.register(self.advance())
+            res.register_advance()
+            self.advance()
             expr = res.register(self.expr())
             if res.error:
                 return res
 
             if self.current_tok.type == TT_RPAREN:
-                res.register(self.advance())
+                res.register_advance()
+                self.advance()
                 return res.success(expr)
             else:
                 return res.failure(
@@ -356,7 +417,7 @@ class Parser:
             InvalidSyntaxError(
                 tok.pos_start,
                 self.current_tok.pos_end,
-                "Expected int, float, '+', '-' or '('",
+                "Expected int, float, identifier, '+', '-' or '('",
             )
         )
 
@@ -368,7 +429,8 @@ class Parser:
         tok = self.current_tok
 
         if tok.type in (TT_PLUS, TT_MINUS):
-            res.register(self.advance())
+            res.register_advance()
+            self.advance()
             factor = res.register(self.factor())
             if res.error:
                 return res
@@ -383,7 +445,53 @@ class Parser:
 
     def expr(self):
         # print("Expression ran")
-        return self.bin_ops(self.term, (TT_PLUS, TT_MINUS))
+        res = ParseResult()
+        if self.current_tok.matches(TT_KEYWORD, "VAR"):
+            res.register_advance()
+            self.advance()
+
+            if self.current_tok.type != TT_IDENTIFIER:
+                return res.failure(
+                    InvalidSyntaxError(
+                        self.current_tok.pos_start,
+                        self.current_tok.pos_end,
+                        "Expected identifier",
+                    )
+                )
+
+            var_name = self.current_tok
+            res.register_advance()
+            self.advance()
+
+            if self.current_tok.type != TT_EQ:
+                return res.failure(
+                    InvalidSyntaxError(
+                        self.current_tok.pos_start,
+                        self.current_tok.pos_end,
+                        "Expected '='",
+                    )
+                )
+
+            res.register_advance()
+            self.advance()
+
+            expr = res.register(self.expr())
+            if res.error:
+                return res
+
+            return res.success(VarAssignNode(var_name, expr))
+
+        node = res.register(self.bin_ops(self.term, (TT_PLUS, TT_MINUS)))
+        if res.error:
+            return res.failure(
+                InvalidSyntaxError(
+                    self.current_tok.pos_start,
+                    self.current_tok.pos_end,
+                    "Expected 'VAR', int, float, identifier, '+', '-', or '('",
+                )
+            )
+
+        return res.success(node)
 
     def bin_ops(self, func_a, op_toks, func_b=None):
         # print("Bin ops ran")
@@ -400,7 +508,8 @@ class Parser:
         # print("Current tok type: ", self.current_tok.type)
         while self.current_tok.type in op_toks:
             op_tok = self.current_tok
-            res.register(self.advance())
+            res.register_advance()
+            self.advance()
             rnode = res.register(func_b())
             if res.error:
                 return res
@@ -478,6 +587,12 @@ class Number:
         if isinstance(other, Number):
             return Number(self.value**other.value).set_context(self.context), None
 
+    def copy(self):
+        copy = Number(self.value)
+        copy.set_pos(self.pos_start, self.pos_end)
+        copy.set_context(self.context)
+        return copy
+
     def __repr__(self):
         return str(self.value)
 
@@ -491,6 +606,29 @@ class Context:
         self.display_name = display_name
         self.parent = parent
         self.parent_entry_pos = parent_entry_pos
+        self.symbol_table = None
+
+
+# ----------------------------------- #
+# ---------- SYMBOL TABLE ----------- #
+
+
+class SymbolTable:
+    def __init__(self):
+        self.symbols = {}
+        self.parent = None
+
+    def get(self, name):
+        value = self.symbols.get(name, None)
+        if value is None and self.parent:
+            return self.parent.get(name)
+        return value
+
+    def set(self, name, value):
+        self.symbols[name] = value
+
+    def remove(self, name):
+        del self.symbols[name]
 
 
 # ----------------------------------- #
@@ -511,6 +649,35 @@ class Interpreter:
             .set_context(context)
             .set_pos(node.pos_start, node.pos_end)
         )
+
+    def visit_VarAccessNode(self, node, context):
+        res = RuntimeResult()
+        var_name = node.var_name_tok.value
+
+        value = context.symbol_table.get(var_name)
+
+        if not value:
+            return res.failure(
+                RuntimeError(
+                    node.pos_start,
+                    node.pos_end,
+                    f"'{var_name}' is not defined",
+                    context,
+                )
+            )
+
+        value = value.copy().set_pos(node.pos_start, node.pos_end)
+        return res.success(value)
+
+    def visit_VarAssignNode(self, node, context):
+        res = RuntimeResult()
+        var_name = node.var_name_tok.value
+        value = res.register(self.visit(node.value_node, context))
+        if res.error:
+            return res
+
+        context.symbol_table.set(var_name, value)
+        return res.success(value)
 
     def visit_BinOpNode(self, node, context):
         res = RuntimeResult()
@@ -562,6 +729,9 @@ class Interpreter:
 # ----------------------------------- #
 # --------------- RUN --------------- #
 
+global_symbol_table = SymbolTable()
+global_symbol_table.set("null", Number(0))
+
 
 def run(fn, text):
     # Generate tokens
@@ -573,7 +743,7 @@ def run(fn, text):
 
     print("Tokens: ", tokens)
     # Generate abstract syntax tree
-    print("Parsing...")
+    # print("Parsing...")
     parser = Parser(tokens)
     ast = parser.parse()
     if ast.error:
@@ -583,6 +753,7 @@ def run(fn, text):
 
     interpreter = Interpreter()
     context = Context("<program>")
+    context.symbol_table = global_symbol_table
     result = interpreter.visit(ast.node, context)
 
     return result.value, result.error
